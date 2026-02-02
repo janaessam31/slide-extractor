@@ -1,0 +1,11 @@
+streamlit
+opencv-python-headless
+torch
+torchvision
+ftfy
+regex
+git+https://github.com/openai/CLIP.git
+img2pdf
+pytesseract
+pillow
+numpy
