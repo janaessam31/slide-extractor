@@ -8,4 +8,5 @@ git+https://github.com/openai/CLIP.git
 img2pdf
 pytesseract
 pillow
+skimage
 numpy
