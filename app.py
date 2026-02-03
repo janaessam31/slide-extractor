@@ -1,212 +1,140 @@
-import os
+import streamlit as st
 import cv2
 import torch
 import clip
 import img2pdf
-import pytesseract
 import numpy as np
-import logging
-import streamlit as st
 import tempfile
+import os
 from PIL import Image
-from datetime import datetime
-from difflib import SequenceMatcher
+from collections import defaultdict
+from skimage.metrics import structural_similarity as ssim
 
-# ============================
-# ⚙️ LOGGING & CACHING
-# ============================
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+# --- PAGE CONFIG ---
+st.set_page_config(page_title="AI Slide Extractor", layout="wide")
+st.title("🎥 Smart Slide Extractor")
+st.markdown("Upload a lecture video to automatically extract unique slides into a PDF.")
 
+# --- SIDEBAR CONTROLS (Dynamic Thresholding) ---
+st.sidebar.header("⚙️ Extraction Settings")
+
+clip_thresh = st.sidebar.slider(
+    "Visual Similarity (CLIP)", 0.70, 0.99, 0.92, 0.01,
+    help="Higher = more sensitive to tiny visual changes. Lower = groups more frames together."
+)
+
+ink_sensitivity = st.sidebar.slider(
+    "Ink Sensitivity (Adaptive)", 1, 50, 15,
+    help="Higher = captures more subtle pen marks/text. Adjust if slides are too dark or too light."
+)
+
+sample_rate = st.sidebar.select_slider(
+    "Sample Every (Seconds)", options=[0.5, 1.0, 2.0, 5.0], value=1.0
+)
+
+# --- CACHE MODEL ---
 @st.cache_resource
-def load_clip_model(device):
-    """Loads the CLIP model once and caches it in memory."""
-    logging.info(f"Loading CLIP model on {device}...")
+def load_clip():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     model, preprocess = clip.load("ViT-B/32", device=device)
-    return model, preprocess
+    return model, preprocess, device
 
-# ============================
-# 🛠️ CONFIGURATION CLASS
-# ============================
-class SlideExtractorConfig:
-    def __init__(self, video_path, output_dir):
-        self.video_path = video_path
-        self.output_dir = output_dir
-        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-        self.pdf_path = os.path.join(output_dir, f"Notes_{self.timestamp}.pdf")
-        
-        # Adjustable Parameters
-        self.sample_rate_seconds = 1.0  
-        self.min_stable_frames = 2
-        self.visual_threshold = 0.92    
-        self.phash_threshold = 8        
-        self.text_sim_threshold = 0.85  
-        
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.edge_mask_percent = 0.08   
-        self.ocr_lang = 'eng' 
+model, preprocess, device = load_clip()
 
-# ============================
-# 🧠 EXTRACTION ENGINE
-# ============================
-class SlideExtractor:
-    def __init__(self, config):
-        self.config = config
-        os.makedirs(self.config.output_dir, exist_ok=True)
-        # Use the cached model loader
-        self.model, self.preprocess = load_clip_model(self.config.device)
-        
-    def get_features(self, frame):
-        h, w = frame.shape[:2]
-        m_h, m_w = int(h * self.config.edge_mask_percent), int(w * self.config.edge_mask_percent)
-        roi = frame[m_h:h-m_h, m_w:w-m_w]
-        
-        # CLIP Visual Features
-        pil_img = Image.fromarray(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
-        img_input = self.preprocess(pil_img).unsqueeze(0).to(self.config.device)
-        with torch.no_grad():
-            visual_feat = self.model.encode_image(img_input)
-            visual_feat /= visual_feat.norm(dim=-1, keepdim=True)
-        
-        # OCR Text
-        raw_text = pytesseract.image_to_string(roi, lang=self.config.ocr_lang)
-        clean_text = " ".join(raw_text.split()).lower()
-        
-        # Perceptual Hash
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        resized = cv2.resize(gray, (9, 8), interpolation=cv2.INTER_AREA)
-        phash = (resized[:, 1:] > resized[:, :-1]).flatten()
-        
-        return {'visual': visual_feat, 'phash': phash, 'text': clean_text, 'path': None}
+# --- CORE LOGIC ---
+def get_features(frame, ink_c):
+    # Adaptive Thresholding (Dynamic Ink Detection)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    # Block size 11, constant ink_c (from slider)
+    binary = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+        cv2.THRESH_BINARY_INV, 11, ink_c
+    )
+    ink_count = np.sum(binary > 0)
 
-    def is_duplicate(self, current_feat, saved_slides):
-        if not saved_slides: return -1
-        curr_text_alnum = "".join(filter(str.isalnum, current_feat['text']))
-        
-        for i in range(len(saved_slides) - 1, -1, -1):
-            old = saved_slides[i]
-            old_text_alnum = "".join(filter(str.isalnum, old['text']))
-            
-            # Textual comparison
-            if len(old_text_alnum) > 10 and len(curr_text_alnum) > 10:
-                if old_text_alnum in curr_text_alnum or SequenceMatcher(None, old_text_alnum, curr_text_alnum).ratio() > self.config.text_sim_threshold:
-                    return i
-            
-            # Visual/Hash comparison
-            dist = np.count_nonzero(current_feat['phash'] != old['phash'])
-            vis_sim = torch.mm(current_feat['visual'], old['visual'].t()).item()
-            if dist <= self.config.phash_threshold or vis_sim > self.config.visual_threshold:
-                return i
-        return -1
+    # CLIP Feature
+    pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    img_input = preprocess(pil_img).unsqueeze(0).to(device)
+    with torch.no_grad():
+        feat = model.encode_image(img_input)
+        feat /= feat.norm(dim=-1, keepdim=True)
+    
+    return feat, ink_count
 
-    def handle_stable_block(self, frame, fno, saved_slides):
-        feat = self.get_features(frame)
-        if len("".join(filter(str.isalnum, feat['text']))) < 10: return 
-        
-        idx = self.is_duplicate(feat, saved_slides)
-        if idx != -1:
-            if len(feat['text']) >= len(saved_slides[idx]['text']):
-                path = saved_slides[idx]['path']
-                saved_slides[idx].update(feat)
-                saved_slides[idx]['path'] = path 
-                cv2.imwrite(path, frame)
-        else:
-            s_idx = len(saved_slides)
-            path = os.path.join(self.config.output_dir, f"slide_{s_idx:03d}.png")
-            cv2.imwrite(path, frame)
-            feat['path'] = path
-            saved_slides.append(feat)
+# --- UI LOGIC ---
+uploaded_file = st.file_uploader("Choose a video file...", type=["mp4", "mov", "avi"])
 
-    def process(self, progress_callback=None):
-        cap = cv2.VideoCapture(self.config.video_path)
+if uploaded_file:
+    tfile = tempfile.NamedTemporaryFile(delete=False)
+    tfile.write(uploaded_file.read())
+    
+    if st.button("🚀 Start Processing"):
+        cap = cv2.VideoCapture(tfile.name)
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        saved_slides, stability_buffer = [], []
-        curr_fno = 0
-        normal_step = max(1, int(fps * self.config.sample_rate_seconds))
         
-        while curr_fno < total_frames:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, curr_fno)
+        slide_history = defaultdict(list)
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        preview_cols = st.columns(4)
+        col_idx = 0
+        
+        last_gray = None
+        
+        for fno in range(0, total_frames, int(fps * sample_rate)):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fno)
             ret, frame = cap.read()
             if not ret: break
             
-            if stability_buffer:
-                s1 = cv2.resize(cv2.cvtColor(stability_buffer[-1], cv2.COLOR_BGR2GRAY), (64, 64))
-                s2 = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (64, 64))
-                if np.mean(cv2.absdiff(s1, s2)) < 4.0:
-                    stability_buffer.append(frame)
-                else:
-                    if len(stability_buffer) >= self.config.min_stable_frames:
-                        self.handle_stable_block(stability_buffer[-1], curr_fno, saved_slides)
-                    stability_buffer = [frame]
-            else:
-                stability_buffer.append(frame)
+            # 1. Fast SSIM check
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if last_gray is not None:
+                score = ssim(last_gray, gray)
+                if score > 0.99: continue
+            last_gray = gray
             
-            curr_fno += normal_step
-            if progress_callback:
-                # FIX: Clamp progress between 0.0 and 1.0 to avoid Streamlit crash
-                progress_callback(min(float(curr_fno / total_frames), 1.0))
-        
-        if len(stability_buffer) >= self.config.min_stable_frames:
-            self.handle_stable_block(stability_buffer[-1], curr_fno, saved_slides)
-        
+            # 2. CLIP & Ink
+            feat, ink = get_features(frame, ink_sensitivity)
+            
+            # 3. Match Logic
+            is_new = True
+            matched_sid = -1
+            
+            for sid, versions in slide_history.items():
+                rep_feat = max(versions, key=lambda x: x['ink'])['feat']
+                sim = torch.mm(feat, rep_feat.t()).item()
+                if sim > clip_thresh:
+                    is_new = False
+                    matched_sid = sid
+                    break
+            
+            if is_new:
+                new_id = len(slide_history)
+                slide_history[new_id].append({'feat': feat, 'ink': ink, 'frame': frame})
+                with preview_cols[col_idx % 4]:
+                    st.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), caption=f"Slide {new_id}")
+                col_idx += 1
+            else:
+                # Update if current frame has more 'content'
+                if ink > max(v['ink'] for v in slide_history[matched_sid]):
+                    slide_history[matched_sid].append({'feat': feat, 'ink': ink, 'frame': frame})
+            
+            progress_bar.progress(fno / total_frames)
+            status_text.text(f"Processing Frame {fno}/{total_frames} | Found {len(slide_history)} slides")
+
         cap.release()
-        return self.export_pdf(saved_slides)
-
-    def export_pdf(self, saved_slides):
-        if not saved_slides: return None
-        paths = sorted([s['path'] for s in saved_slides])
-        with open(self.config.pdf_path, "wb") as f:
-            f.write(img2pdf.convert(paths))
-        return self.config.pdf_path
-
-# ============================
-# 🖥️ STREAMLIT UI
-# ============================
-st.set_page_config(page_title="AI Slide Extractor", page_icon="📝")
-st.title("📝 Video to PDF Slide Extractor")
-st.markdown("Upload a lecture video to extract high-quality, unique slides into a PDF.")
-
-# Sidebar for tuning
-with st.sidebar:
-    st.header("Settings")
-    sample_rate = st.slider("Sampling Interval (sec)", 0.5, 5.0, 1.0)
-    v_thresh = st.slider("Visual Similarity", 0.80, 0.99, 0.92)
-
-uploaded_file = st.file_uploader("Upload Video", type=["mp4", "mov", "avi"])
-
-if uploaded_file:
-    with tempfile.TemporaryDirectory() as temp_dir:
-        video_path = os.path.join(temp_dir, "input_video.mp4")
-        slides_dir = os.path.join(temp_dir, "slides")
         
-        with open(video_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        
-        if st.button("Start Extraction"):
-            config = SlideExtractorConfig(video_path, slides_dir)
-            config.sample_rate_seconds = sample_rate
-            config.visual_threshold = v_thresh
+        # Save to PDF
+        st.success("✅ Processing Complete!")
+        pdf_paths = []
+        for sid in sorted(slide_history.keys()):
+            best = max(slide_history[sid], key=lambda x: x['ink'])
+            img_path = f"slide_{sid}.png"
+            cv2.imwrite(img_path, best['frame'])
+            pdf_paths.append(img_path)
             
-            extractor = SlideExtractor(config)
+        with open("notes.pdf", "wb") as f:
+            f.write(img2pdf.convert(pdf_paths))
             
-            progress_bar = st.progress(0.0)
-            status_text = st.empty()
-            
-            def update_progress(p):
-                progress_bar.progress(p)
-                status_text.text(f"Analyzing frames... {int(p*100)}%")
-
-            with st.spinner("Processing video... this may take a few minutes."):
-                pdf_result = extractor.process(progress_callback=update_progress)
-            
-            if pdf_result and os.path.exists(pdf_result):
-                st.success("Extraction Complete!")
-                with open(pdf_result, "rb") as f:
-                    st.download_button(
-                        label="📥 Download PDF Slides",
-                        data=f,
-                        file_name=f"Slides_{datetime.now().strftime('%Y%m%d')}.pdf",
-                        mime="application/pdf"
-                    )
-            else:
-                st.error("No slides were detected. Check the video content or lower the similarity threshold.")
+        with open("notes.pdf", "rb") as f:
+            st.download_button("📥 Download Final PDF", f, file_name="lecture_notes.pdf")
