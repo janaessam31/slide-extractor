@@ -1,8 +1,13 @@
 streamlit
 opencv-python-headless
 torch
-clip-by-openai
+torchvision
+ftfy
+regex
+tqdm
+git+https://github.com/openai/CLIP.git
 img2pdf
 numpy
-pillow
+pytesseract
 scikit-image
+Pillow
